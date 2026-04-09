@@ -81,3 +81,68 @@ def create_source_bin(index, uri):
         nbin.add_pad(Gst.GhostPad.new_no_target("src", Gst.PadDirection.SRC))
 
     return nbin
+
+
+def create_inference_branch(pipeline, index, source_pad, config_file, unique_id):
+    """
+    Each sub-mux must use a UNIQUE sink pad index across the whole pipeline.
+    So stream 0 uses sub_mux.sink_0, stream 1 uses sub_mux.sink_1, etc.
+    Then demux must read src_<same_index>.
+    """
+    q1 = Gst.ElementFactory.make("queue", f"sub_q1_{index}")
+    mux = Gst.ElementFactory.make("nvstreammux", f"sub_mux_{index}")
+    pgie = Gst.ElementFactory.make("nvinfer", f"sub_pgie_{index}")
+    demux = Gst.ElementFactory.make("nvstreamdemux", f"sub_demux_{index}")
+    q2 = Gst.ElementFactory.make("queue", f"sub_q2_{index}")
+
+    if not q1 or not mux or not pgie or not demux or not q2:
+        sys.stderr.write(f"Failed to create inference elements for branch {index}\n")
+        return None
+
+    # New nvstreammux safe properties
+    mux.set_property("batch-size", 1)
+    mux.set_property("batched-push-timeout", 40000)
+
+    pgie.set_property("config-file-path", config_file)
+    pgie.set_property("unique-id", unique_id)
+
+    print(f"[INFO] Stream {index}: config={config_file}, unique-id={unique_id}")
+
+    for elem in [q1, mux, pgie, demux, q2]:
+        pipeline.add(elem)
+
+    if source_pad.link(q1.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+        sys.stderr.write(f"Failed to link source -> q1 for stream {index}\n")
+        return None
+
+    # CRITICAL FIX:
+    # use sink_<index>, not sink_0 for every sub-mux
+    sub_mux_sinkpad = mux.request_pad_simple(f"sink_{index}")
+    if not sub_mux_sinkpad:
+        sys.stderr.write(f"Failed to request sink_{index} from sub mux for stream {index}\n")
+        return None
+
+    if q1.get_static_pad("src").link(sub_mux_sinkpad) != Gst.PadLinkReturn.OK:
+        sys.stderr.write(f"Failed to link q1 -> sub mux for stream {index}\n")
+        return None
+
+    if not mux.link(pgie):
+        sys.stderr.write(f"Failed to link sub mux -> pgie for stream {index}\n")
+        return None
+
+    if not pgie.link(demux):
+        sys.stderr.write(f"Failed to link pgie -> demux for stream {index}\n")
+        return None
+
+    # CRITICAL FIX:
+    # demux output pad must match the same stream index
+    demux_srcpad = demux.request_pad_simple(f"src_{index}")
+    if not demux_srcpad:
+        sys.stderr.write(f"Failed to request src_{index} from demux for stream {index}\n")
+        return None
+
+    if demux_srcpad.link(q2.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+        sys.stderr.write(f"Failed to link demux -> q2 for stream {index}\n")
+        return None
+
+    return q2.get_static_pad("src")
