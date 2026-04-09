@@ -8,3 +8,6 @@ env/
 .vscode/
 .idea/
 *.log
+*.onnx
+*.engine
+*.so
